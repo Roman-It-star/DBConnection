@@ -4,11 +4,14 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Configuration;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Windows;
 using System.Windows.Forms;
+using System.Xml.Linq;
 
 namespace DBConnection
 {
@@ -148,8 +151,7 @@ namespace DBConnection
                 MessageBox.Show("Ошибка при получении данных: " + ex.Message);
             }
         }
-
-        private void btnTransaction_Click(object sender, EventArgs e)
+        private void btnAddProduct_Click(object sender, EventArgs e)
         {
             if (connection.State != ConnectionState.Open)
             {
@@ -157,68 +159,91 @@ namespace DBConnection
                 return;
             }
 
-            // Начинаем транзакцию
-            var transaction = connection.BeginTransaction();
-
-            try
+            string name = txtProductName.Text.Trim();
+            if (!decimal.TryParse(txtPrice.Text, out decimal price))
             {
-                using (var command = connection.CreateCommand())
-                {
-                    command.Transaction = transaction;
-
-                    // Вставка первого продукта
-                    // ⚠️ НЕ УКАЗЫВАЕМ productid — он автоинкремент
-                    command.CommandText = @"INSERT INTO ""product"" 
-(productname, supplierid, categoryid, quantityperunit, unitprice, unitsinstock, unitsonorder, reorderlevel, discontinued)
-VALUES ('Auto Product A', 1, 1, '12 bottles', 12.5, 10, 0, 0, 0);";
-                    command.ExecuteNonQuery();
-
-                    command.CommandText = @"INSERT INTO ""product"" 
-(productname, supplierid, categoryid, quantityperunit, unitprice, unitsinstock, unitsonorder, reorderlevel, discontinued)
-VALUES ('Auto Product B', 1, 1, '6 bottles', 8.5, 7, 0, 0, 0);";
-                    command.ExecuteNonQuery();
-
-                    // Коммитим (подтверждаем)
-                    transaction.Commit();
-                    MessageBox.Show("Оба продукта успешно добавлены в базу.");
-                }
+                MessageBox.Show("Введите корректную цену.");
+                return;
             }
-            catch (Exception ex)
+            string categoryName = txtNewCategory.Text.Trim();
+            if (string.IsNullOrEmpty(categoryName))
             {
-                MessageBox.Show("Ошибка при вставке данных: " + ex.Message);
+                MessageBox.Show("Введите название категории.");
+                return;
+            }
 
+            using (var transaction = connection.BeginTransaction())
+            {
                 try
                 {
-                    transaction.Rollback();
-                    MessageBox.Show("Транзакция отменена.");
+                    int categoryId;
+                    using (var cmd = connection.CreateCommand())
+                    {
+                        cmd.Transaction = transaction;
+                        // 1. Проверим, есть ли уже такая категория
+                        cmd.CommandText = "SELECT categoryid FROM \"category\" WHERE categoryname = @name;";
+                        cmd.Parameters.AddWithValue("name", categoryName);
+                        object result = cmd.ExecuteScalar();
+
+                        if (result != null)
+                        {
+                            categoryId = Convert.ToInt32(result); // Категория уже существует
+                        }
+                        else
+                        {
+                            // Вставим новую
+                            cmd.CommandText = "INSERT INTO \"category\" (categoryname) VALUES (@name) RETURNING categoryid;";
+                            categoryId = Convert.ToInt32(cmd.ExecuteScalar());
+                        }
+                    }
+
+                    using (var cmd = connection.CreateCommand())
+                    {
+                        cmd.Transaction = transaction;
+                        cmd.CommandText = @"INSERT INTO ""product"" (productname, supplierid, categoryid, quantityperunit, unitprice, unitsinstock, unitsonorder, reorderlevel, discontinued)
+                                          VALUES(@name, 1, @catid, '1 unit', @price, 10, 0, 0, 0);";
+
+                        cmd.Parameters.AddWithValue("name", name);
+                        cmd.Parameters.AddWithValue("price", price);
+                        cmd.Parameters.AddWithValue("catid", categoryId);
+                        cmd.ExecuteNonQuery();
+                    }
+
+                    transaction.Commit();
+                    MessageBox.Show("Продукт успешно добавлен.");
+                    LoadProductsByCategory();
                 }
-                catch (Exception rollbackEx)
+                catch (Exception ex)
                 {
-                    MessageBox.Show("Ошибка при откате транзакции: " + rollbackEx.Message);
+                    transaction.Rollback();
+                    MessageBox.Show("Ошибка: " + ex.Message);
                 }
             }
-
         }
 
         private void btnDeleteProduct_Click(object sender, EventArgs e)
         {
-            if (listViewProducts.SelectedItems.Count == 0)
-                return;
-
+            if (listViewProducts.SelectedItems.Count == 0) return;
             int productId = (int)listViewProducts.SelectedItems[0].Tag;
 
-            var result = MessageBox.Show("Удалить товар?", "Удаление", MessageBoxButtons.YesNo);
-            if (result != DialogResult.Yes)
-                return;
-
+            using (var transaction = connection.BeginTransaction())
             using (var command = connection.CreateCommand())
             {
-                command.CommandText = "DELETE FROM \"product\" WHERE productid = @id";
-                command.Parameters.AddWithValue("id", productId);
-
-                int rows = command.ExecuteNonQuery();
-                MessageBox.Show(rows > 0 ? "Удалено!" : "Не найдено.");
-                btnLoadProducts.PerformClick();
+                try
+                {
+                    command.Transaction = transaction;
+                    command.CommandText = "DELETE FROM \"product\" WHERE productid = @id";
+                    command.Parameters.AddWithValue("id", productId);
+                    command.ExecuteNonQuery();
+                    transaction.Commit();
+                    MessageBox.Show("Удалено");
+                    btnLoadProducts.PerformClick();
+                }
+                catch (Exception ex)
+                {
+                    transaction.Rollback();
+                    MessageBox.Show("Ошибка: " + ex.Message);
+                }
             }
         }
 
@@ -240,37 +265,37 @@ VALUES ('Auto Product B', 1, 1, '6 bottles', 8.5, 7, 0, 0, 0);";
             int productId = (int)listViewProducts.SelectedItems[0].Tag;
             int categoryId = (int)((ComboBoxItem)cmbCategory.SelectedItem).Value;
 
-            try
+            using (var transaction = connection.BeginTransaction())
+            using (var command = connection.CreateCommand())
             {
-                using (var command = connection.CreateCommand())
+                try
                 {
-                    command.CommandText = @"
-                UPDATE ""product""
-                SET productname = @name, unitprice = @price, categoryid = @cat
-                WHERE productid = @id";
-
+                    command.Transaction = transaction;
+                    command.CommandText = @"UPDATE ""product""
+                        SET productname = @name, unitprice = @price, categoryid = @cat
+                        WHERE productid = @id"; 
+                    
                     command.Parameters.AddWithValue("name", newName);
                     command.Parameters.AddWithValue("price", newPrice);
                     command.Parameters.AddWithValue("cat", categoryId);
                     command.Parameters.AddWithValue("id", productId);
 
-                    int rows = command.ExecuteNonQuery();
-
-                    MessageBox.Show(rows > 0 ? "Обновлено!" : "Продукт не найден.");
+                    command.ExecuteNonQuery();
+                    transaction.Commit();
+                    MessageBox.Show("Обновлено");
                     btnLoadProducts.PerformClick();
                 }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Ошибка обновления: " + ex.Message);
+                catch (Exception ex)
+                {
+                    transaction.Rollback();
+                    MessageBox.Show("Ошибка обновления: " + ex.Message);
+                }
             }
         }
 
         private void listViewProducts_DoubleClick(object sender, EventArgs e)
         {
-            if (listViewProducts.SelectedItems.Count == 0)
-                return;
-
+            if (listViewProducts.SelectedItems.Count == 0) return;
             var selectedItem = listViewProducts.SelectedItems[0];
 
             // Получаем текст из колонок
@@ -289,7 +314,6 @@ VALUES ('Auto Product B', 1, 1, '6 bottles', 8.5, 7, 0, 0, 0);";
             {
                 command.CommandText = "SELECT categoryid FROM \"product\" WHERE productid = @id";
                 command.Parameters.AddWithValue("id", productId);
-
                 var categoryId = command.ExecuteScalar();
 
                 // Выбираем нужный элемент в ComboBox по значению
@@ -314,7 +338,6 @@ VALUES ('Auto Product B', 1, 1, '6 bottles', 8.5, 7, 0, 0, 0);";
             }
 
             listViewProducts.Items.Clear();
-
             var selectedCategory = (ComboBoxItem)cmbCategory.SelectedItem;
 
             using (var command = connection.CreateCommand())
